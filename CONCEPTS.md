@@ -1,284 +1,215 @@
-# Mini RocksDB — The Concepts (read before building)
+# my notes on how mini rocksdb works
 
-Goal: understand an **LSM-tree** key-value store deeply enough to rebuild a focused
-version in Rust, benchmark it against real RocksDB, and explain the trade-offs.
+these are my learning notes. i want to understand how rocksdb works inside so i can
+build a small version of it myself. rocksdb uses an lsm tree. many databases like
+leveldb, cassandra and scylla also use the lsm tree idea. so if i learn this one thing
+i understand a lot of databases at once.
 
-RocksDB (and LevelDB, Cassandra, ScyllaDB, TiKV, CockroachDB's storage, and the storage
-under many databases) is built on the **LSM-tree** (Log-Structured Merge-tree). Learn LSM
-= understand all of them.
+## the problem this solves
 
----
+a key value store needs to do put, get and delete. it also should scan keys in order.
+the hard part is doing all this fast on disk when the data is bigger than memory.
 
-## 0. The problem LSM solves
+there are two ways to keep data on disk.
 
-A key-value store must support: `put(key, value)`, `get(key)`, `delete(key)`, and ideally
-ordered range scans. The hard part is doing this **fast on disk** when data is bigger than
-RAM.
+the first way is a b tree. postgres and mysql use this. it keeps keys sorted in pages
+and it updates them in place. reading is fast. but writing is slow because every write
+becomes a random write on disk. random writes are the slowest thing a disk does.
 
-Two ways to lay data on disk:
+the second way is the lsm tree. rocksdb uses this. it never updates in place. it keeps
+new writes in memory first, and then writes them out as new files that never change.
+so writes become simple appends at the end. this is much faster.
 
-**B-tree (Postgres, MySQL/InnoDB):** keeps keys sorted in fixed pages, updated **in place**.
-- Read: great — walk the tree, O(log n), few page reads.
-- Write: bad — every write is a **random** disk write (find the page, modify, write back).
-  Random writes are the slowest thing a disk does.
+the trade off is simple. the lsm tree makes writes fast but reads slower, because one
+key can be in many files. so it is a good choice when you write a lot, like logs,
+metrics and events. that is the kind of thing i want to build later.
 
-**LSM-tree (RocksDB):** never updates in place. Buffers writes in memory, then flushes them
-as **new immutable sorted files**. Writes become **sequential** appends.
-- Write: great — sequential writes are 100–1000× faster than random on HDD, and much
-  kinder to SSD (less write wear, better throughput).
-- Read: worse — a key might live in any of several files; you may check many.
+one line to remember. an lsm tree just keeps adding data, and then cleans itself up
+later.
 
-**The core trade-off in one line:** LSM trades read cost for write cost. It's the right
-choice for **write-heavy** workloads — logs, metrics, event streams, time-series. Exactly
-your roadmap's territory.
+## the parts of the engine
 
-> Key mental model: **an LSM is an append-only system that periodically tidies itself up.**
-> Writes append. Cleanup (compaction) merges and discards. That's the whole philosophy.
+when i call put with a key and value, this is what happens.
 
----
+first i write the change to a log file on disk. this is the wal. it keeps my data safe
+if the program crashes.
 
-## 1. The moving parts (the whole engine in one picture)
+second i put the change into the memtable. this is a sorted table that lives in memory.
 
-```
-        put(k,v) / delete(k)
-              │
-              ▼
-   ┌──────────────────────┐   append first, for durability
-   │  WAL (write-ahead log)│──────────────►  disk (sequential append)
-   └──────────────────────┘
-              │
-              ▼
-   ┌──────────────────────┐   sorted, in RAM, fast
-   │  Memtable (BTreeMap)  │
-   └──────────────────────┘
-              │  when full (e.g. 4 MB)  → "flush"
-              ▼
-   ┌──────────────────────┐   immutable, sorted, on disk
-   │   SSTable (L0 file)   │   + Bloom filter + sparse index
-   └──────────────────────┘
-              │  background "compaction" merges files
-              ▼
-   L1, L2, ... larger, fewer, non-overlapping SSTables
-```
+when the memtable gets full, i write it out to a file on disk. this file is called an
+sstable. this step is called a flush.
 
-Read path walks these **newest → oldest**:
-```
-get(k):  Memtable  →  L0 SSTables (newest first)  →  L1  →  L2 ...
-         first hit wins (newest version of the key)
-```
+in the background a job called compaction merges the small files into bigger and
+cleaner files.
 
----
-
-## 2. WAL — Write-Ahead Log (durability)
-
-**Problem:** the Memtable lives in RAM. If the process crashes, unflushed writes vanish.
-
-**Fix:** before touching the Memtable, **append the operation to a log file on disk** and
-`fsync` it. Now the write survives a crash. On restart, **replay** the WAL to rebuild the
-Memtable exactly as it was.
-
-- Append-only, sequential → cheap.
-- One WAL per Memtable. When the Memtable flushes to an SSTable (now safely on disk), its
-  WAL can be deleted — the data is durable elsewhere.
-- Record format (you'll design it): `[op:1][key_len:4][key][val_len:4][val]` as raw bytes.
-
-This is the same WAL idea in Postgres, Kafka, and etcd. Learn it once.
-
-**Rust you'll use:** `File`, `BufWriter`, `write_all`, `flush`/`sync_all`, byte encoding
-(`to_le_bytes`). → your LeetCode `lc08` (parsing) and Lesson 02 (`Result`/`?`) pay off here.
-
----
-
-## 3. Memtable — in-memory sorted buffer
-
-The live write buffer. Every `put`/`delete` lands here (after the WAL append).
-
-- **Sorted by key** so that flushing produces a sorted file and range scans work. In Rust:
-  `BTreeMap<Vec<u8>, Entry>` gives you sorted-by-key for free.
-- Stores an **`Entry`** per key: either `Value(bytes)` or `Tombstone` (a delete marker).
-- Has a size limit (say 4 MB). When exceeded → becomes immutable and gets flushed; a fresh
-  Memtable takes new writes. (Real RocksDB keeps the old one readable while flushing.)
-
-You already built a toy version of this in **Lesson 03**. Same shape.
-
----
-
-## 4. SSTable — Sorted String Table (the on-disk file)
-
-When a Memtable is full, its sorted contents are written out as one **immutable** file: the
-SSTable. "Immutable" is the magic word — once written, never modified. Updates and deletes
-are handled by writing *newer* SSTables, not editing old ones.
-
-An SSTable holds, in key-sorted order:
-- **Data block:** the actual `key → Entry` pairs, sorted.
-- **Sparse index:** not every key — every Nth key with its byte offset. To find a key, binary
-  search the sparse index to get "somewhere near here," then scan a small block. (Sparse =
-  index fits in RAM even when data doesn't.) → your binary-search LeetCode (`lc10–lc12`).
-- **Bloom filter:** see §6.
-- **Footer:** fixed-size trailer with offsets to the index/filter so a reader knows where
-  everything is.
-
-Because SSTables are sorted and immutable, **merging two of them is a simple linear merge**
-(like merging two sorted lists — your `lc22`). Merging many is a k-way heap merge
-(`lc26`). That's not a coincidence — those problems ARE this engine.
-
----
-
-## 5. Flush and Compaction (the "tidy up")
-
-**Flush:** Memtable (RAM) → new SSTable at **Level 0 (L0)**. Fast, just dumps sorted data.
-
-**Compaction:** background process that merges SSTables into fewer, larger, cleaner files.
-Why it's essential:
-1. Reads get slow if a key could be in 20 files → merge to reduce file count.
-2. Old/overwritten values and tombstones pile up → compaction **drops** them, reclaiming space.
-
-**Leveled compaction (RocksDB's default):**
-- **L0:** files come straight from flushes. They can have **overlapping** key ranges (file A
-  and file B might both contain key "cat"). So a read may check *all* L0 files.
-- **L1 and below:** files are **non-overlapping** within a level and each level is ~10× bigger
-  than the one above. Non-overlapping means: for a given key, at most **one** file per level
-  can contain it → binary-search the file list, check one file. Fast reads.
-- Compaction picks a file in Ln, finds the overlapping files in Ln+1, merges them, writes new
-  Ln+1 files, deletes the inputs.
-
-> **The talk's twist (your Serverless-ClickHouse flagship):** there, compaction's goal isn't
-> "fewer files" — it's "minimize *intersecting* files per timestamp," so a time-range query
-> touches as few files as possible. Same machinery, different objective. Mini RocksDB teaches
-> the machinery; the log engine reuses it with a new goal.
-
-**Amplification — the three costs you'll benchmark:**
-- **Write amplification:** 1 logical write may be physically rewritten many times as it moves
-  down levels. (This is the exact cost the talk complains about with ClickHouse materialized
-  views.)
-- **Read amplification:** one `get` may touch several files/levels.
-- **Space amplification:** dead data lingers until compaction reclaims it.
-
-You can't win all three. Compaction strategy = choosing which to sacrifice. Measuring this
-trade-off IS your Medium article.
-
----
-
-## 6. Bloom filter — skip files you don't need to read
-
-Read amplification's killer feature. A **Bloom filter** is a small bit-array that answers
-"is key X in this SSTable?" with:
-- **"definitely not"** — skip the file entirely (no disk read), or
-- **"maybe"** — go check the file.
-
-It never gives false negatives (never says "no" when the answer is yes), only occasional
-false positives ("maybe" when actually no). So it safely skips most files that lack the key.
-
-How it works: hash the key with k different hashes, set/test those k bits. If any tested bit
-is 0 → definitely absent. Tiny (bits per key), huge read speedup on point lookups —
-especially "needle in a haystack" queries (the UUID-lookup case from the talk).
-
-**Rust you'll use:** bit manipulation, hashing (`ahash`/`xxhash`). Ties to LeetCode `lc02`
-(membership intuition).
-
----
-
-## 7. Tombstones — how deletes work
-
-You can't erase a key from an immutable file. So `delete(key)` **writes a marker** — a
-**tombstone** — into the Memtable/SSTable that says "this key is dead as of now."
-
-On read, if the newest version of a key is a tombstone → report "not found," even if older
-SSTables still hold a value. During compaction, once the tombstone has out-lived every older
-value for that key, both are dropped and the space is reclaimed.
-
-This is why `get` returns `Option`: `None` can mean "never existed" *or* "tombstoned." Your
-`Entry` enum from Lesson 03 models exactly this.
-
----
-
-## 8. Read path (put it all together)
+so the flow is like this.
 
 ```
-get(key):
-  1. Check Memtable.               hit? return (Value → Some, Tombstone → None)
-  2. Check L0 SSTables newest→oldest. For each: Bloom says "maybe"? → binary-search index
-                                       → read block → found? return.
-  3. Check L1, L2, ... : binary-search the file list (non-overlapping), check the one file.
-  4. Never found anywhere → None.
-  Newest version always wins — that's why order matters.
+put key value
+   goes to wal file first (safe on disk)
+   then goes to memtable (sorted, in memory)
+   when memtable is full it is flushed to an sstable file
+   later compaction merges the files
 ```
 
-Every optimization (Bloom filter, sparse index, level structure, non-overlap) exists to make
-this walk touch **as little disk as possible**. That's the entire game of storage engines,
-and the same instinct behind "bytes scanned / files touched" in your benchmark metrics.
+## the wal (write ahead log)
 
----
+the memtable lives in memory. if the program crashes the memtable is gone and i lose
+the new writes.
 
-## 9. Recovery (crash safety)
+to fix this i write every change to a log file first, before i touch the memtable, and
+i make sure it is really saved on disk. now the write is safe. when the program starts
+again i read the log file and build the memtable back. this is called replay.
 
-On startup:
-1. Find existing SSTables (from a manifest/catalog of which files exist at which level).
-2. Find the WAL(s) for any Memtable that hadn't flushed.
-3. **Replay** the WAL to rebuild the in-memory Memtable.
-Now state == exactly what it was before the crash. Durability achieved without ever doing a
-random in-place write.
+the log file is only appended at the end so it is cheap. when the memtable is flushed to
+an sstable, the data is safe in the file, so the old log can be deleted.
 
-Real RocksDB tracks the file set in a **MANIFEST** (itself a log of "added file X to level N,
-removed file Y"). You'll build a simplified version.
+## the memtable
 
----
+this is where new writes go after the wal. every put and delete goes here.
 
-## 10. What we build vs skip (scope for Mini RocksDB)
+it is sorted by key. i keep it sorted so that when i flush it, the file is already
+sorted, and so range scans work. in rust a btree map keeps keys sorted for me.
 
-**Build (v1):**
-- Bytes keys/values (`Vec<u8>` / `&[u8]`)
-- WAL with append + replay
-- Memtable (`BTreeMap`) with `Entry = Value | Tombstone`
-- SSTable writer + reader (data block, sparse index, footer)
-- Bloom filter per SSTable
-- Flush (Memtable → L0)
-- Simple compaction (start: merge all L0 into one file; then: leveled)
-- `get` across Memtable + all SSTables, newest-wins
-- Recovery via WAL replay
-- **Benchmark harness** (criterion): random/sequential writes, point reads, vs RocksDB.
-  Measure p50/p99, throughput, write/read/space amplification, bytes written.
+for each key it stores either a value, or a delete marker. that delete marker is called
+a tombstone. i will explain it below.
 
-**Skip (v1) — add only if a later project needs it:**
-- Concurrency/MVCC snapshots (add when it teaches something)
-- Column families, transactions, block cache tuning
-- Compression (add as a benchmark variable later)
-- Distributed anything
+the memtable has a size limit. when it is full it becomes read only and gets flushed,
+and a new empty memtable takes the new writes.
 
-**The $10 principle here:** the point isn't "I replaced RocksDB." It's "I reproduced the LSM
-core, measured the amplification trade-offs, and found exactly where RocksDB's extra
-machinery (leveled compaction, block cache, MANIFEST) becomes necessary."
+## the sstable (sorted file on disk)
 
----
+when the memtable is full i write all its data into one file. this file is sorted by
+key and it never changes after that. this is important. i never edit an old file. if a
+key is updated or deleted, that just goes into a newer file.
 
-## 11. Build order (each step = a Week of the Rust workbook)
+inside the file i keep, in sorted order, the key and value pairs, a small index, a bloom
+filter, and a footer at the end that tells me where the index and filter are.
+
+the index is a sparse index. it does not store every key. it stores every few keys with
+their position in the file. to find a key i search the index to get close, then i scan a
+small part of the file. a sparse index is small so it can stay in memory even when the
+data can not.
+
+because the files are sorted and never change, merging two of them is easy. it is just
+like merging two sorted lists. merging many of them uses a heap.
+
+## flush and compaction
+
+flush is when the memtable in memory is written to a new sstable file. this file goes to
+level zero.
+
+compaction is a background job that merges sstable files into fewer and bigger files. i
+need it for two reasons. first, if a key can be in many files, reads get slow, so i want
+fewer files. second, old values and delete markers pile up and waste space, so
+compaction throws them away.
+
+levels work like this. level zero files come straight from flushes, so they can have
+keys that overlap each other. that means a read may have to check all level zero files.
+lower levels keep files that do not overlap inside the level, and each level is about
+ten times bigger than the one above it. no overlap means for one key there is at most
+one file per level to check, so reads are fast.
+
+there are three costs i will measure. these are called amplification.
+
+write amplification is when one write gets rewritten many times as it moves down the
+levels.
+
+read amplification is when one get has to touch many files.
+
+space amplification is when dead data stays around until compaction removes it.
+
+i can not make all three small at the same time. choosing which one to give up is the
+whole game. measuring this is what makes a good blog post.
+
+## the bloom filter
+
+this is the trick that makes reads fast. a bloom filter is a small set of bits that can
+answer one question. is this key in this file. it answers in two ways. it can say the
+key is definitely not here, so i skip the whole file and read nothing from disk. or it
+can say the key is maybe here, so i go and check.
+
+it never says no when the answer is yes. it only sometimes says maybe when the real
+answer is no. so it safely skips most files that do not have the key. it is very small
+and it saves a lot of disk reads, mostly for single key lookups.
+
+## tombstones (how delete works)
+
+i can not erase a key from a file that never changes. so a delete just writes a marker
+that says this key is dead from now on. this marker is the tombstone.
+
+when i read a key, the newest version wins. if the newest version is a tombstone i
+answer not found, even if an older file still has a value. later during compaction, once
+the tombstone is older than every value for that key, both are removed and the space is
+freed.
+
+this is why get returns an optional value. not found can mean the key never existed, or
+that it was deleted.
+
+## the read path
+
+this is how get works, all parts together.
 
 ```
-1. Memtable (in-RAM, BTreeMap, Entry enum)          ← Lesson 03 already did the core
-2. WAL append + replay  → put/get/delete durable
-3. SSTable write (flush Memtable → sorted file) + read (scan)
-4. Sparse index + footer → fast lookup in an SSTable
-5. Bloom filter → skip SSTables on miss
-6. get() across Memtable + L0 SSTables (newest wins)
-7. Compaction (merge L0 files, drop overwrites/tombstones)
-8. Recovery (replay WAL on startup)
-9. Benchmark harness → graphs → vs RocksDB → Medium/LinkedIn
+get key
+   check the memtable first
+   then check level zero files, newest first
+   then check level one, level two and so on
+   the newest version of the key wins
+   if it is not found anywhere, answer not found
 ```
 
-Each step compiles, runs, and has a test. By step 6 you have a working durable KV store.
-Steps 7–9 are what make it *good* and give you the content.
+for each file, the bloom filter is checked first. if it says maybe, then i search the
+index, then read a small block. every trick here exists to make this read touch as
+little disk as possible. that is the whole point of a storage engine.
 
----
+## recovery (safe after a crash)
 
-## 12. The content this produces
+when the program starts again it does this. it finds the sstable files that already
+exist. it finds the log files for any memtable that was not flushed yet. it replays the
+log to build the memtable back. now the state is the same as before the crash. and i
+never had to do a slow random write to get this safety.
 
-- **GitHub:** the repo — README, this CONCEPTS doc, architecture diagram, benchmark graphs,
-  "where mini-rocksdb stops and real RocksDB starts" section.
-- **Medium:** "I built an LSM-tree in Rust and benchmarked it against RocksDB" —
-  Problem → LSM design → implementation → benchmark → the amplification wall → lessons.
-- **LinkedIn:** build-logs per milestone — "Added Bloom filters. Point-lookup misses went
-  from touching 8 files to 1. p99 dropped from X to Y. Here's why."
+## what i will build and what i will skip
 
-All measured, none generic. This is flagship-prep: the LSM/SSTable/compaction machinery here
-is reused directly in Mini Iceberg and Serverless ClickHouse.
+i will build these first.
+
+- keys and values as bytes
+- the wal, with append and replay
+- the memtable using a btree map, with value or tombstone
+- writing and reading an sstable, with a sparse index and a footer
+- a bloom filter for each sstable
+- flush from memtable to a level zero file
+- simple compaction, first just merge all level zero files into one
+- get across the memtable and all files, newest wins
+- recovery by replaying the log
+- a benchmark to test it and compare with real rocksdb
+
+i will skip these for now and add them only if a later project needs them.
+
+- snapshots and multi version reads
+- column families and transactions
+- compression, i will add this later as a benchmark option
+- anything distributed
+
+the idea is not to replace rocksdb. the idea is to build the core of the lsm tree, measure
+the costs, and find out exactly where the real rocksdb needs its extra parts.
+
+## the build order
+
+i will do one part at a time. each part should build, run, and have a test.
+
 ```
+1. memtable in memory
+2. wal append and replay, so put get delete are safe
+3. write the memtable to an sstable file, and read it back
+4. add the sparse index and footer, to find a key fast
+5. add the bloom filter, to skip files with a miss
+6. get across the memtable and all files, newest wins
+7. compaction, merge files and drop old values and tombstones
+8. recovery, replay the log on start
+9. benchmark, make graphs, compare with real rocksdb
+```
+
+by step six i will have a working key value store that is safe on disk. steps seven to
+nine make it good and give me the results to write about.
