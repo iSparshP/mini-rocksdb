@@ -51,6 +51,13 @@ impl Wal {
         Ok(())
     }
 
+    // empty the log. i call this after a flush, when the data is safe in an sstable.
+    pub fn clear(&mut self) -> io::Result<()> {
+        self.file.set_len(0)?;
+        self.file.flush()?;
+        Ok(())
+    }
+
     pub fn read_all<P: AsRef<Path>>(path: P) -> io::Result<Vec<WalRecord>> {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
