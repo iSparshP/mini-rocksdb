@@ -44,16 +44,6 @@ impl Memtable {
             None => None,
         }
     }
-
-    // how many keys are in the memtable.
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    // is the memtable empty.
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
-    }
 }
 
 #[cfg(test)]
@@ -87,14 +77,5 @@ mod tests {
         m.put(b"k", b"value");
         m.delete(b"k");
         assert_eq!(m.get(b"k"), None);
-    }
-
-    #[test]
-    fn len_counts_keys() {
-        let mut m = Memtable::new();
-        assert!(m.is_empty());
-        m.put(b"a", b"1");
-        m.put(b"b", b"2");
-        assert_eq!(m.len(), 2);
     }
 }
