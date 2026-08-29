@@ -3,6 +3,7 @@
 // step 1: the memtable (writes go here first, in memory).
 
 mod memtable;
+mod wal;
 
 use memtable::Memtable;
 
